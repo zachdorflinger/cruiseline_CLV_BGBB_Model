@@ -1,0 +1,395 @@
+---
+title: "Cruise Line Customer Lifetime Value: BG / BB Model"
+author: "Brian Bates, Zach Dorflinger, Kristina Paterson, Chris Stocks"
+date: "2/6/2020"
+output: html_document
+---
+
+```{r, include=F, warning=F}
+library(dplyr)
+library(ggplot2)
+library(xtable)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(BTYD)
+library(scales)
+
+options(digits = 3)
+options(xtable.comment = F)
+```
+
+```{r}
+# Data Import / Cleaning
+# Calibration
+raw_calib <- read.delim("./cruises_calib.txt", header = T, sep = "")
+
+data_calib <- as.data.frame(t(spread(raw_calib,key=ID,value=1,fill=0))) %>% 
+    setNames(c("ID","2010","2011","2012","2013","2014")) %>% 
+    slice(-1) %>% 
+    mutate_at(vars(-ID), function(x) {ifelse(x>0,1,0)}) %>% 
+    mutate(
+        X = rowSums(.[-1]),
+        tx = ifelse(`2014` > 0, 5,
+                    ifelse(`2013` > 0, 4,
+                           ifelse(`2012` > 0, 3,
+                                  ifelse(`2011` > 0, 2,
+                                         ifelse(`2010` > 0, 1, 0)))))
+    )
+
+summary_calib <- data_calib %>% 
+    group_by(X) %>% 
+    summarise(Count = n())
+
+# Holdout
+raw_hold <- read.delim("./cruises_hold.txt", header = T, sep = "")
+
+data_hold <- t(spread(raw_hold,key=ID,value=1,fill=0))
+data_hold <- data.frame(names = row.names(data_hold), data_hold) %>% 
+    setNames(c("ID","2015","2016","2017","2018")) %>% 
+    slice(-1) %>% 
+    mutate_at(vars(-ID), function(x) {ifelse(x>0,1,0)}) %>% 
+    mutate(
+        X = rowSums(.[-1]),
+        ID = as.numeric(as.character(ID))
+    )
+
+# Combined
+data_full <- left_join(x = select(data_calib, -c(X, tx)),
+                       y = select(data_hold, -c(X)),
+                       by = "ID") %>% 
+    replace(is.na(.), 0) %>% 
+    mutate(
+        X = rowSums(.[-1]),
+        tx = ifelse(`2018` > 0, 9,
+                ifelse(`2017` > 0, 8,
+                    ifelse(`2016` > 0, 7,
+                        ifelse(`2015` > 0, 6,
+                            ifelse(`2014` > 0, 5,
+                                ifelse(`2013` > 0, 4,
+                                    ifelse(`2012` > 0, 3,
+                                        ifelse(`2011` > 0, 2,
+                                            ifelse(`2010` > 0, 1, 0)))))))))
+    )
+
+summary_holdout <- data_full %>% 
+    select(ID, `2015`:`2018`) %>% 
+    mutate(X = rowSums(.[-1])) %>% 
+    group_by(X) %>% 
+    summarise(Count = n())
+
+summary_full <- data_full %>% 
+    group_by(X) %>% 
+    summarise(Count = n())
+
+# Automated way to calculate tx. Works, but is MUCH slower than if statements.
+# numeric_years <- as.numeric(colnames(select(data_full, -c(ID, X, tx))))
+# for (i in 1:nrow(data_full)) {
+#     data_full[i, "tx"] = max(numeric_years * select(data_full, -c(ID, X, tx)))
+# }
+```
+
+### 1. Estimating the BB and BG-BB models 
+
+#### Beta-Binomial
+
+```{r}
+# Model Estimation
+log_bb <- function(x,m,a,b) {
+  lchoose(m,x) + lbeta(a+x,b+m-x) - lbeta(a,b)
+}
+
+LL_BB <- function(pars, x, m) {
+  a <- exp(pars[1]) 
+  b <- exp(pars[2])
+  z <- log_bb(x,m,a,b)
+  return(-sum(z))
+}
+
+start <- log(c(1,1))
+opt <- optim(start, LL_BB, x = data_calib$X, m=5)
+```
+
+```{r}
+# Parameter Estimates
+a <- exp(opt$par[1])
+b <- exp(opt$par[2])
+
+LL <- opt$value
+
+avg_theta <- a / (a + b)
+var_theta <- (a*b) / (((a + b)^2) *(a + b + 1))
+```
+
+```{r}
+# Probability density plot
+ggplot(tibble(theta=c(.001,.999)), aes(x=theta)) %>% +
+  stat_function(fun=dbeta, 
+                args=list(shape1=a,shape2=b), 
+                geom="line", color = "blue") %>% + 
+  scale_x_continuous(expression("Probability of Cruising") , breaks= seq(0,1,.1)) %>% + 
+  scale_y_continuous("Proportion of Customers") %>% +
+  geom_vline(xintercept=avg_theta, linetype=5) %>% + 
+  theme(axis.text.y=element_blank())
+```
+
+The parameter estimates for the BB model are the following: 
+
+* $\alpha$: `r round(a, 3)`
+* $\beta$: `r round(b, 3)`
+* Log-likelihood: `r comma_format()(round(LL, 1))`
+* Avg cruise probability ($\theta$): `r round(avg_theta*100, 1)`%
+* Variance of cruise probability: `r round(var_theta*100, 1)`%
+
+According to this model, the typical customer in the data has a 9% likelihood
+of taking a cruise in any given year. There is variation in this likelihood, 
+however, and most customers have very low likelihoods of cruising in a given
+year. Very few customers are more likely than not to cruise in any specific 
+year.
+
+#### Beta-Geometric / Beta-Binomial
+
+```{r}
+# Model Estimation
+get_bgbb_LL <- function(pars, x, tx, m) {
+  p <- exp(pars)
+  bg_LL <- bgbb.LL(p, x, tx, m)
+  return(-sum(bg_LL))
+}
+st <- rep(0,4)
+
+bgbb_opt <- optim(st, get_bgbb_LL,
+                  x=data_calib$X,
+                  tx=data_calib$tx,
+                  m=5,
+                  method = "BFGS")
+```
+
+```{r}
+# Parameter Estimates
+bgbb_pars <- exp(bgbb_opt[['par']])
+bgbb_LL <- bgbb_opt[['value']]
+
+bgbb_a <- bgbb_pars[1]
+bgbb_b <- bgbb_pars[2]
+
+avg_bgbb_p <- bgbb_a / (bgbb_a + bgbb_b)
+var_bgbb_p <- (bgbb_a*bgbb_b) / (((bgbb_a + bgbb_b)^2) *(bgbb_a + bgbb_b + 1))
+
+bgbb_c <- bgbb_pars[3]
+bgbb_d <- bgbb_pars[4]
+
+avg_bgbb_theta <- bgbb_c / (bgbb_c + bgbb_d)
+var_bgbb_theta <- (bgbb_c*bgbb_d) / (((bgbb_c + bgbb_d)^2) *(bgbb_c + bgbb_d + 1))
+```
+
+```{r}
+# Cruise probability density
+ggplot(tibble(theta=c(.01,.99)), aes(x=theta)) %>% +
+  stat_function(fun=dbeta, 
+                args=list(shape1=bgbb_a,shape2=bgbb_b), 
+                geom="line", color = "blue") %>% + 
+  scale_x_continuous(expression("Probability of Cruising") , breaks=seq(0,1,.1)) %>% + 
+  scale_y_continuous("Proportion of Customers") %>% +
+  geom_vline(xintercept=avg_bgbb_p, linetype=3) %>% + 
+  theme(axis.text.y=element_blank()) +
+  ggtitle("Variation in Cruise Probability")
+
+# Death probability density
+ggplot(tibble(theta=c(.01,.99)), aes(x=theta)) %>% +
+  stat_function(fun=dbeta, 
+                args=list(shape1=bgbb_c,shape2=bgbb_d), 
+                geom="line", color = "blue") %>% + 
+  scale_x_continuous(expression("Probability of Dropping") , breaks=seq(0,1,.1)) %>% + 
+  scale_y_continuous("Proportion of Customers") %>% +
+  geom_vline(xintercept=avg_bgbb_theta, linetype=3) %>% + 
+  theme(axis.text.y=element_blank()) +
+  ggtitle("Variation in Death Probability")
+
+```
+
+The parameter estimates for the BB/BG model are the following: 
+
+* $\alpha$: `r round(bgbb_a, 3)`
+* $\beta$: `r round(bgbb_b, 3)`
+* c: `r round(bgbb_c, 3)`
+* d: `r round(bgbb_d, 3)`
+* Log-likelihood: `r comma_format()(round(bgbb_LL, 1))`
+* Avg cruise probability: `r round(avg_bgbb_p*100, 1)`%
+* Variance of cruise probability: `r round(var_bgbb_p*100, 1)`%
+* Avg death probability: `r round(avg_bgbb_theta*100, 1)`%
+* Variance of death probability: `r round(var_bgbb_theta*100, 1)`%
+
+According to this model, the typical consumer has a 12% likelihood of taking
+a cruise in any given year, conditional on the fact that they have not "died" or
+decided not to take any cruises ever again. Most customers who are still alive
+have a probability of cruising in the neighborhood of 5-30%. The likelihood of 
+"death" for the average coustomer is 12.3% in any given year, however there
+are a decent number of customers with mugh higher likelihoods. 
+
+### 2. Model Performance In-sample
+
+```{r}
+# BB 
+pred_in_sample <- data.frame("X" = 0:5, "bb_prob" = NA)
+for (i in 0:5) {
+  pred_in_sample$bb_prob[i+1] = exp(log_bb(i,5, a, b))
+}
+pred_in_sample$bb_estimate <- pred_in_sample$bb_prob * nrow(data_calib)
+
+# BGBB
+pred_in_sample$bgbb_prob <- bgbb.pmf(bgbb_pars, 5, 0:5)
+pred_in_sample$bgbb_estimate <- pred_in_sample$bgbb_prob * nrow(data_calib)
+
+# Actual
+pred_in_sample <- merge(pred_in_sample, summary_calib, by="X")
+
+# Formatting
+table_in_sample <- pred_in_sample %>% 
+    select(c(X, Count, bb_estimate, bgbb_estimate)) %>% 
+    rename(
+        "Num Cruises" = X,
+        "Actual" = Count,
+        "BB Estimate" = bb_estimate,
+        "BGBB Estimate" = bgbb_estimate
+    ) %>% 
+    mutate_all(round)
+```
+
+```{r}
+# Table
+kable(table_in_sample) %>% 
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+```{r}
+# Plot
+graph_data <- gather(table_in_sample, Model, value, -`Num Cruises`)
+
+ggplot(graph_data, aes(x = `Num Cruises`, y = value, fill = Model)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_x_continuous(breaks = seq(0, 5, 1)) +
+    xlab('Total Transactions: 2010-2014') + 
+    ylab('Number of Customers') + 
+    ggtitle('Actual Customers vs Estimated: Calibration Period')
+```
+
+Both models appear to fit the data quite well during the calibration period
+(2010-2014). There are slight differences between the model predictions 
+and actual results, but overall, model performance is solid. This makes sense,
+as the models are trained using this data and there are a small number of years
+in the sample, so creating a model that matches the small amount of data nearly 
+perfectly is not a challenge.
+
+### 3. Model Performance in Holdout Period
+
+```{r}
+# BB 
+pred_out_sample <- data.frame("X" = 0:4, "bb_prob" = NA)
+for (i in 0:4) {
+  pred_out_sample$bb_prob[i+1] = exp(log_bb(i,4, a, b))
+}
+pred_out_sample$bb_estimate <- pred_out_sample$bb_prob * nrow(data_calib)
+
+# BGBB
+pred_out_sample$bgbb_prob <- bgbb.pmf.General(bgbb_pars,5,4,0:4)
+pred_out_sample$bgbb_estimate <- pred_out_sample$bgbb_prob * nrow(data_calib)
+
+# Actual
+pred_out_sample <- merge(pred_out_sample, summary_holdout, by="X")
+
+# Formatting
+table_out_sample <- pred_out_sample %>% 
+    select(c(X, Count, bb_estimate, bgbb_estimate)) %>% 
+    rename(
+        "Num Cruises" = X,
+        "Actual" = Count,
+        "BB Estimate" = bb_estimate,
+        "BGBB Estimate" = bgbb_estimate
+    ) %>% 
+    mutate_all(round)
+```
+
+```{r}
+# Table
+kable(table_out_sample) %>% 
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+```{r}
+# Plot
+graph_data <- gather(table_out_sample, Model, value, -`Num Cruises`)
+
+ggplot(graph_data, aes(x = `Num Cruises`, y = value, fill = Model)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_x_continuous(breaks = seq(0, 5, 1)) +
+    xlab('Total Transactions: 2015-2018') + 
+    ylab('Number of Customers') + 
+    ggtitle('Actual Customers vs Estimated: Holdout Period')
+```
+
+The BG/BB model predictions align much closer with the actual transaction levels
+in 2015-2018 than the BB model. The BB model underestimates how many consumers 
+took 0 cruises during the period, while the BG/BB did not. This is consistent
+with the model assumptions, as the BG/BB model appears to be correctly diagnosing
+customers that have "died" or dropped out of the sample while the BB model is not.
+
+### 4. BG-BB Forecasting
+
+#### A) Number of Surviving Customers
+
+```{r}
+probs_vector <- bgbb.PAlive(bgbb_pars, 
+                            x = data_full$X, 
+                            t.x = data_full$tx, 
+                            n.cal = 9)
+num_alive <- sum(probs_vector)
+```
+
+According to the estimated BG/BB model, we expect `r comma_format()(round(num_alive))`
+customers to still be alive at the beginning of 2019.
+
+#### B) Total Expected Residual Lifetime Value
+
+```{r}
+dert_vector <- bgbb.DERT(bgbb_pars, 
+                         x = data_full$X, 
+                         t.x = data_full$tx,
+                         n.cal = 9,
+                         d = 0.13)
+total_value <- 241 * sum(dert_vector)
+```
+
+The total expected residual lifetime value of the 2009 cohort at the beginning
+of 2019 is $`r comma_format()(round(total_value))`.
+
+### 5. Potential New Customer Acquisition
+
+#### A) Expected Cruises from 2020-2024
+
+```{r}
+forecast <- data.frame(
+    "Year" = 2020:2024,
+    "Est.Cruises" = round(bgbb.pmf(bgbb_pars, 5, 0:4) * 11993)
+)
+
+kable(forecast) %>% 
+    kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+#### B) Max Willingness to Pay
+
+```{r}
+# DERT of a new customer with no prior info
+blind_dert <- bgbb.DERT(bgbb_pars, 
+                        x = 0,
+                        t.x = 0,
+                        n.cal = 0,
+                        d = 0.13)
+
+# Num expected transactions (DERT + guaranteed one) * customers * margin
+value <- (blind_dert + 1) * 11993 * 241
+```
+
+The estimated value of the 11,993 new customers is $`r comma_format()(round(value))`.
+The company should not spend more than this amount on the campaign.
